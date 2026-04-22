@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./assets/banner.png" alt="Function as a Service — Resonate example" />
+</p>
+
 # Modulate: On-Premise FaaS Platform with Resonate
 
 **A demo Function-as-a-Service platform demonstrating how to build infrastructure with Resonate.**
