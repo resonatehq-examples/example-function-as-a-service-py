@@ -1,3 +1,11 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/banner-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="./assets/banner-light.png">
+    <img alt="Function as a Service — Resonate example" src="./assets/banner-dark.png">
+  </picture>
+</p>
+
 # Modulate: On-Premise FaaS Platform with Resonate
 
 **A demo Function-as-a-Service platform demonstrating how to build infrastructure with Resonate.**
