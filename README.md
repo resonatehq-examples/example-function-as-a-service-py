@@ -43,14 +43,14 @@ These features make Resonate an excellent choice for building a FaaS platform, e
 ```
 ┌─────────────┐
 │   Client    │ Submit function execution
-│  (HTTP/CLI) │
+│  (modulate) │
 └──────┬──────┘
        │
        ▼
 ┌─────────────┐
-│  modulate   │ Router (entry worker group)
-│  (Router)   │ - Accepts function submissions
-└──────┬──────┘ - Routes to appropriate workers
+│  Resonate   │ Durable message router
+│   Server    │ - Holds durable promises
+└──────┬──────┘ - Routes tasks to worker groups
        │
        ├──────────────┐
        ▼              ▼
@@ -63,7 +63,7 @@ These features make Resonate an excellent choice for building a FaaS platform, e
 
 **Components:**
 
-1. **Router (modulate.py)** - Entry point that accepts function submissions and routes them to workers
+1. **CLI (modulate.py)** - Submits scripts to the Resonate server, which routes them to workers
 2. **Workers (worker.py)** - Execute user functions in specialized groups (GPU, CPU, etc.)
 3. **Resonate Server** - Coordinates message passing and provides durability
 
@@ -71,7 +71,6 @@ These features make Resonate an excellent choice for building a FaaS platform, e
 
 - **Task Routing** - Directing work to specific worker groups (GPU vs CPU)
 - **RPC (Remote Function Call)** - Blocking calls that wait for results
-- **RFI (Remote Function Invocation)** - Fire-and-forget calls
 - **Detached Execution** - Background tasks that don't block the caller
 - **Worker Groups** - Organizing workers by capability (GPU, CPU)
 
@@ -96,55 +95,39 @@ uv sync
 resonate dev
 ```
 
-### 2. Start the Router (Entry Worker)
+### 2. Start Worker(s)
+
+In a separate terminal, start a GPU worker:
 
 ```bash
-uv run python modulate.py --mode router
+uv run python worker.py
 ```
 
-This starts the entry worker group that accepts function submissions.
-
-### 3. Start Worker(s)
-
-In separate terminals, start workers for different groups:
-
-**GPU Worker:**
-```bash
-uv run python worker.py --group gpu
-```
-
-**CPU Worker (optional):**
-```bash
-uv run python worker.py --group cpu
-```
-
-The workers poll Resonate for tasks routed to their group.
+To add a CPU worker (optional), start another instance in a separate terminal.
 
 ## Usage
 
 ### Submit a Function for Execution
 
-**Fire-and-Forget (RFI):**
+**Wait for result (blocks until complete):**
 ```bash
-uv run python modulate.py --script hello.py --id task-001 --machine-type gpu
+uv run python modulate.py --id task-001 hello.py
 ```
 
-Returns immediately. The function executes in the background.
-
-**Wait for Result (RPC):**
+**Fire-and-forget (returns immediately):**
 ```bash
-uv run python modulate.py --script hello.py --id task-002 --machine-type gpu --wait
+uv run python modulate.py --id task-002 --no-wait hello.py
 ```
 
-Blocks until the function completes and returns the result.
+If `--id` is omitted a random uuid is used; print the id and pass it to `--get` later.
 
 ### Check Execution Status
 
 ```bash
-uv run python modulate.py --get task-001
+uv run python modulate.py --get task-002
 ```
 
-Returns the result if execution completed, or `None` if still running.
+Returns the result filename if execution completed, or a "not ready" message if still running.
 
 ## Example Function
 
@@ -164,78 +147,66 @@ print(f"Result: {result}")
 
 Submit it:
 ```bash
-uv run python modulate.py --script hello.py --id gpu-job-1 --machine-type gpu
+uv run python modulate.py --id gpu-job-1 hello.py
 ```
 
 ## How It Works
 
-### 1. Function Submission (Router)
+### 1. Function Submission
 
-[modulate.py:31](modulate.py#L31-L46) - The router reads your script and submits it to the appropriate worker group:
+`modulate.py` reads your script and submits it as a durable Resonate promise routed to the target worker group:
 
 ```python
-@resonate.register(retry_policy=never())
-def prep_execute(ctx: Context, id, script, machine_type, wait):
-    with open(script, "r") as file:
-        content = file.read()
+async def prep_execute(ctx: Context, job_id: str, script: str, machine_type: str, wait: bool):
+    with open(script) as f:
+        content = f.read()
 
     if wait:
-        # RPC: Wait for result
-        result = yield ctx.rfc(execute, content, id).options(
-            id=id, send_to=poll("gpu")
-        )
+        # RPC: block until the worker returns
+        result = await ctx.options(target=machine_type).rpc("execute", content, job_id)
         return result
     else:
-        # RFI: Fire and forget
-        yield ctx.detached(detached_id, detached_rfi, content, id, "gpu")
+        # Detached: fire-and-forget background execution
+        await ctx.detached("detached_rfi", content, job_id, machine_type)
         return None
 ```
 
 ### 2. Function Execution (Worker)
 
-[worker.py](worker.py) - Workers in the "gpu" group pick up tasks and execute them:
+`worker.py` — workers in the `"gpu"` group pick up tasks and execute them:
 
 ```python
-@resonate.register()
-def execute(ctx: Context, script_content, id):
-    exec(script_content)
-    return {"id": id, "status": "completed"}
+async def execute(ctx: Context, script_content: str, script_id: str) -> str:
+    # runs the script in a sandboxed subprocess
+    ...
+    return output_filename
 ```
 
 ### 3. Result Retrieval
 
-[modulate.py:13](modulate.py#L13-L18) - Check if execution completed:
+`modulate.py --get <id>` looks up the durable promise by its stable id:
 
 ```python
-def get_by_id(id):
-    record = resonate.promises.get(id=id)
-    if record.is_completed:
-        return record.value.data
-    return None
+record = await resonate.promises.get(f"execution-{args.get_id}")
+if record.state == "resolved":
+    print(f"Job results located at: {record.value.data}")
 ```
 
 ## Key Concepts
 
 ### Worker Groups
 
-Workers register with a specific group (`gpu`, `cpu`, etc.). The router directs tasks to groups using `send_to=poll("gpu")`.
+Workers register with a specific group (`gpu`, `cpu`, etc.). The router directs tasks to groups using `ctx.options(target="gpu").rpc(...)`.
 
 This enables:
 - GPU-intensive workloads → GPU workers
 - CPU-bound tasks → CPU workers
 - Custom hardware → Specialized worker groups
 
-### RPC vs RFI
+### RPC vs Detached
 
-- **RPC (Remote Function Call)** - `ctx.rfc()` - Waits for result, blocks caller
-- **RFI (Remote Function Invocation)** - `ctx.rfi()` - Fire-and-forget, returns immediately
-
-### Detached Execution
-
-`ctx.detached()` starts a background task that doesn't block the caller. Useful for:
-- Long-running computations
-- Background processing
-- Fire-and-forget tasks
+- **RPC** - `ctx.rpc()` - Dispatches to a remote worker and awaits the result
+- **Detached** - `ctx.detached()` - Fire-and-forget; the caller returns immediately
 
 ### Crash Recovery
 
@@ -270,7 +241,6 @@ This pattern applies to:
 
 - [Resonate Python SDK Docs](https://docs.resonatehq.io/sdk/python)
 - [Task Routing Patterns](https://docs.resonatehq.io/patterns/routing)
-- [RPC vs RFI](https://docs.resonatehq.io/concepts/rpc-rfi)
 
 ## Related Examples
 

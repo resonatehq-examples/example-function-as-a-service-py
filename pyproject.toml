@@ -4,4 +4,4 @@ version = "0.1.0"
 description = "Modulate: Demo on-premise FaaS platform built with Resonate"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["resonate-sdk>=0.6.7"]
+dependencies = ["resonate-sdk>=0.7.1"]
