@@ -1,110 +1,161 @@
-import uuid
-from resonate.resonate import Resonate
-from resonate.retry_policy import never
-from resonate.stores.remote import RemoteStore
-from resonate.context import Context
-from resonate.task_sources.poller import Poller
-from resonate.targets import poll
+"""Modulate — CLI for submitting scripts to a Resonate FaaS worker.
+
+Usage:
+    # Submit a script and wait for the result:
+    uv run python modulate.py --id task-001 hello.py
+
+    # Submit without waiting (fire-and-forget):
+    uv run python modulate.py --id task-001 --no-wait hello.py
+
+    # Check the status of a previous submission:
+    uv run python modulate.py --get task-001
+
+The job id (--id) is used as a stable key for Resonate's idempotency
+guarantee: submitting the same id twice re-attaches to the existing run
+rather than launching a second one.
+"""
+
+from __future__ import annotations
+
 import argparse
+import asyncio
+import os
+import uuid
 
-resonate = Resonate(store=RemoteStore(), task_source=Poller(group="entry"))
+from resonate.context import Context
+from resonate.resonate import Resonate
+from resonate.retry import Never
 
-
-def get_by_id(id):
-    record = resonate.promises.get(id=id)
-    if record.is_completed:
-        return record.value.data
-    return None
-
-
-@resonate.register()
-def execute(ctx: Context, script_content, id): ...
+RESONATE_URL = os.environ.get("RESONATE_URL", "http://localhost:8001")
 
 
-@resonate.register(retry_policy=never())
-def detached_rfi(ctx: Context, content, id, machine_type):
-    yield ctx.rfi(execute, content, id).options(id=id, send_to=poll("gpu"))
-    return
+# ---------------------------------------------------------------------------
+# Workflow steps registered on the worker (gpu group).
+# The stub here tells Resonate the function name and signature; the real
+# implementation lives in worker.py and runs on a gpu-group worker process.
+# ---------------------------------------------------------------------------
+
+async def execute(ctx: Context, script_content: str, script_id: str) -> str: ...
 
 
-@resonate.register(retry_policy=never())
-def prep_execute(ctx: Context, id, script, machine_type, wait):
+# ---------------------------------------------------------------------------
+# Durable workflows running on this process (entry group).
+# ---------------------------------------------------------------------------
+
+async def detached_rfi(ctx: Context, content: str, job_id: str, machine_type: str) -> None:
+    """Fire-and-forget wrapper: dispatch execute to the target worker group."""
+    await ctx.options(target=machine_type).rpc("execute", content, job_id)
+
+
+async def prep_execute(
+    ctx: Context,
+    job_id: str,
+    script: str,
+    machine_type: str,
+    wait: bool,
+) -> str | None:
+    """Read ``script`` and dispatch it to a worker in ``machine_type`` group.
+
+    When ``wait`` is True the call blocks until the worker returns; when False
+    the execution is detached and this function returns immediately.
+    """
     try:
-        content = ""
-        with open(script, "r") as file:
-            content = file.read()
+        with open(script) as f:
+            content = f.read()
 
-        print("Sending script to be executed in gpu")
+        print(f"Sending script to be executed on {machine_type}")
         if wait:
-            result = yield ctx.rfc(execute, content, id).options(
-                id=id, send_to=poll("gpu")
+            result: str = await ctx.options(target=machine_type).rpc(
+                "execute", content, job_id
             )
             return result
         else:
-            detached_id = f"detached_{id}"
-            yield ctx.detached(detached_id, detached_rfi, content, id, "gpu")
+            await ctx.detached("detached_rfi", content, job_id, machine_type)
             return None
 
-    except FileNotFoundError as ef:
+    except FileNotFoundError as e:
         print("Error: File not found.")
-        raise ef
-    except Exception as e:  # Catch any other exceptions
+        raise e
+    except Exception as e:
         print(f"An error occurred: {e}")
         raise e
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Execute a Python script remotely.")
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+async def _main() -> None:
+    parser = argparse.ArgumentParser(description="Submit a Python script to a Modulate FaaS worker.")
     parser.add_argument(
-        "-m",
-        "--machine",
+        "-m", "--machine",
         dest="machine_type",
-        help="Type of machine to execute on.",
         default="gpu",
+        help="Worker group to execute on (default: gpu).",
     )
     parser.add_argument(
-        "-i", "--id", dest="id", help="Sets an id, defaults to a random uuid."
+        "-i", "--id",
+        dest="id",
+        help="Stable job id (defaults to a random uuid).",
     )
     parser.add_argument(
-        "-w",
-        "--no-wait",
+        "-w", "--no-wait",
         dest="wait",
         action="store_false",
-        help="Wait for the script to finish.",
+        help="Return immediately without waiting for the result.",
     )
     parser.add_argument(
-        "-l", "--local", action="store_true", help="Force local execution."
+        "--get",
+        dest="get_id",
+        metavar="ID",
+        help="Retrieve the result for a previously submitted job id.",
     )
-    parser.add_argument("--get", dest="get_id", action="store", help="Which id to get")
-
     args, argv = parser.parse_known_args()
 
-    if args.get_id is not None:
-        res = get_by_id(args.get_id)
-        if res:
-            print(f"Job results located at: {res}")
-        else:
-            print(f"Job {args.get_id} is not ready yet.")
+    resonate = Resonate(url=RESONATE_URL, group="entry")
+    resonate.register(execute)
+    resonate.register(detached_rfi, retry_policy=Never())
+    resonate.register(prep_execute, retry_policy=Never())
 
-        return
+    # Yield once so the HttpNetwork background start task runs before any
+    # direct client call (e.g. promises.get) — avoids a startup-race error.
+    await asyncio.sleep(0)
 
-    id = args.id
-    if args.id is None:
-        id = str(uuid.uuid4())
+    try:
+        if args.get_id is not None:
+            promise_id = f"execution-{args.get_id}"
+            try:
+                record = await resonate.promises.get(promise_id)
+                if record.state == "resolved":
+                    print(f"Job results located at: {record.value.data}")
+                else:
+                    print(f"Job {args.get_id} is not ready yet (state: {record.state}).")
+            except Exception:
+                print(f"Job {args.get_id} not found or server unreachable.")
+            return
 
-    print(f"You can retrive this execution using {id}")
-    if len(argv) < 1:
-        print("Script name is required")
-        exit(1)
+        job_id = args.id or str(uuid.uuid4())
+        print(f"You can retrieve this execution using {job_id}")
 
-    print(f"Will execute {argv[0]} in {args.machine_type}...")
-    handle = prep_execute.run(
-        f"execution-{id}-{uuid.uuid4()}", id, argv[0], args.machine_type, args.wait
-    )
+        if len(argv) < 1:
+            print("Script name is required")
+            raise SystemExit(1)
 
-    result = handle.result()
-    if result is not None:
-        print(f"results are located at {result}")
+        print(f"Will execute {argv[0]} on {args.machine_type}...")
+        handle = resonate.run(
+            f"execution-{job_id}", prep_execute, job_id, argv[0], args.machine_type, args.wait
+        )
+
+        result = await handle.result()
+        if result is not None:
+            print(f"Results are located at {result}")
+
+    finally:
+        await resonate.stop()
+
+
+def main() -> None:
+    asyncio.run(_main())
 
 
 if __name__ == "__main__":
